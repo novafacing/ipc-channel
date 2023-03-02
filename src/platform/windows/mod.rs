@@ -14,6 +14,7 @@ use crate::ipc;
 use libc::intptr_t;
 use std::cell::{Cell, RefCell};
 use std::cmp::PartialEq;
+use std::convert::TryInto;
 use std::default::Default;
 use std::env;
 use std::error::Error as StdError;
@@ -25,13 +26,16 @@ use std::mem;
 use std::ops::{Deref, DerefMut, RangeFrom};
 use std::os::windows::io::IntoRawHandle;
 use std::ptr;
+use std::ptr::null_mut;
 use std::slice;
 use std::thread;
+use std::time::Duration;
 use uuid::Uuid;
 use winapi::um::winnt::{HANDLE};
 use winapi::um::handleapi::{INVALID_HANDLE_VALUE};
-use winapi::shared::minwindef::{LPVOID};
+use winapi::shared::minwindef::{TRUE, FALSE, LPVOID};
 use winapi;
+use winapi::um::synchapi::CreateEventA;
 
 mod aliased_cell;
 use self::aliased_cell::AliasedCell;
@@ -275,8 +279,8 @@ fn dup_handle_to_process_with_flags(handle: &WinHandle, other_process: &WinHandl
         let mut new_handle: HANDLE = INVALID_HANDLE_VALUE;
         let ok = winapi::um::handleapi::DuplicateHandle(CURRENT_PROCESS_HANDLE.as_raw(), handle.as_raw(),
                                            other_process.as_raw(), &mut new_handle,
-                                           0, winapi::shared::minwindef::FALSE, flags);
-        if ok == winapi::shared::minwindef::FALSE {
+                                           0, FALSE, flags);
+        if ok == FALSE {
             Err(WinError::last("DuplicateHandle"))
         } else {
             Ok(WinHandle::new(new_handle))
@@ -399,7 +403,7 @@ struct AsyncData {
     /// This must be on the heap, in order for its memory location --
     /// which is registered in the kernel during an async read --
     /// to remain stable even when the enclosing structure is passed around.
-    ov: NoDebug<Box<winapi::um::minwinbase::OVERLAPPED>>,
+    ov: NoDebug<Box<Overlapped>>,
 
     /// Buffer for the kernel to store the results of the async read operation.
     ///
@@ -408,6 +412,40 @@ struct AsyncData {
     /// If part of the vector is already filled, that is left in place;
     /// the new data will only be written to the unused space.
     buf: Vec<u8>,
+}
+
+#[repr(transparent)]
+struct Overlapped(winapi::um::minwinbase::OVERLAPPED);
+
+impl Drop for Overlapped {
+    fn drop(&mut self) {
+        unsafe {
+            if self.0.hEvent != null_mut() && self.0.hEvent != INVALID_HANDLE_VALUE {
+                let result = winapi::um::handleapi::CloseHandle(self.0.hEvent);
+                assert!(thread::panicking() || result != 0);
+            }
+        }
+    }
+}
+
+impl Overlapped {
+    fn new(ov: winapi::um::minwinbase::OVERLAPPED) -> Self {
+        Self(ov)
+    }
+}
+
+impl Deref for Overlapped {
+    type Target = winapi::um::minwinbase::OVERLAPPED;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for Overlapped {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
 }
 
 /// Main object keeping track of a receive handle and its associated state.
@@ -524,9 +562,9 @@ impl MessageReader {
     fn issue_async_cancel(&mut self) {
         unsafe {
             let status = winapi::um::ioapiset::CancelIoEx(self.r#async.as_ref().unwrap().alias().handle.as_raw(),
-                                              &mut **self.r#async.as_mut().unwrap().alias_mut().ov.deref_mut());
+                                              &mut ***self.r#async.as_mut().unwrap().alias_mut().ov.deref_mut());
 
-            if status == winapi::shared::minwindef::FALSE {
+            if status == FALSE {
                 // A cancel operation is not expected to fail.
                 // If it does, callers are not prepared for that -- so we have to bail.
                 //
@@ -603,18 +641,23 @@ impl MessageReader {
             // issue the read to the buffer, at the current length offset
             self.r#async = Some(AliasedCell::new(AsyncData {
                 handle: self.handle.take(),
-                ov: NoDebug(Box::new(mem::zeroed())),
+                ov: NoDebug(Box::new({
+                    let mut overlapped: winapi::um::minwinbase::OVERLAPPED = mem::zeroed();
+                    // Create a manually reset event. The documentation for GetOverlappedResultEx
+                    // states you must do this in the remarks section.
+                    overlapped.hEvent = CreateEventA(ptr::null_mut(), TRUE, FALSE, ptr::null_mut());
+                    Overlapped::new(overlapped)
+                })),
                 buf: mem::replace(&mut self.read_buf, vec![]),
             }));
-            let mut bytes_read: u32 = 0;
             let ok = {
                 let async_data = self.r#async.as_mut().unwrap().alias_mut();
                 let remaining_buf = &mut async_data.buf[buf_len..];
                 winapi::um::fileapi::ReadFile(async_data.handle.as_raw(),
                                    remaining_buf.as_mut_ptr() as LPVOID,
                                    remaining_buf.len() as u32,
-                                   &mut bytes_read,
-                                    &mut **async_data.ov.deref_mut())
+                                   ptr::null_mut(),
+                                    &mut ***async_data.ov.deref_mut())
             };
 
             // Reset the vector to only expose the already filled part.
@@ -632,7 +675,7 @@ impl MessageReader {
             // which would bear some risk of getting out of sync.
             self.r#async.as_mut().unwrap().alias_mut().buf.set_len(buf_len);
 
-            let result = if ok == winapi::shared::minwindef::FALSE {
+            let result = if ok == FALSE {
                 Err(GetLastError())
             } else {
                 Ok(())
@@ -735,30 +778,38 @@ impl MessageReader {
     /// since it's still aliased by the kernel.
     /// (And there is nothing new to pick up anyway.)
     /// It will only become available again
-    /// when `fetch_async_result()` returns sucessfully upon retry.
+    /// when `fetch_async_result()` returns successfully upon retry.
     /// (Or the async read is aborted with `cancel_io()`.)
     fn fetch_async_result(&mut self, blocking_mode: BlockingMode) -> Result<(), WinError> {
         unsafe {
             // Get the overlapped result, blocking if we need to.
             let mut nbytes: u32 = 0;
-            let block = match blocking_mode {
-                BlockingMode::Blocking => winapi::shared::minwindef::TRUE,
-                BlockingMode::Nonblocking => winapi::shared::minwindef::FALSE,
+            let timeout = match blocking_mode {
+                BlockingMode::Blocking => winapi::um::winbase::INFINITE,
+                BlockingMode::Nonblocking => 0,
+                BlockingMode::Timeout(duration) => duration.as_millis().try_into().unwrap_or(winapi::um::winbase::INFINITE),
             };
-            let ok = winapi::um::ioapiset::GetOverlappedResult(self.r#async.as_ref().unwrap().alias().handle.as_raw(),
-                                                   &mut **self.r#async.as_mut().unwrap().alias_mut().ov.deref_mut(),
+            let ok = winapi::um::ioapiset::GetOverlappedResultEx(self.r#async.as_ref().unwrap().alias().handle.as_raw(),
+                                                   &mut ***self.r#async.as_mut().unwrap().alias_mut().ov.deref_mut(),
                                                    &mut nbytes,
-                                                   block);
-            let io_result = if ok == winapi::shared::minwindef::FALSE {
+                                                   timeout,
+                                                   FALSE);
+            winapi::um::synchapi::ResetEvent(self.r#async.as_mut().unwrap().alias_mut().ov.deref_mut().hEvent);
+            let io_result = if ok == FALSE {
                 let err = GetLastError();
-                if blocking_mode == BlockingMode::Nonblocking && err == winapi::shared::winerror::ERROR_IO_INCOMPLETE {
+                if blocking_mode != BlockingMode::Blocking && err == winapi::shared::winerror::ERROR_IO_INCOMPLETE {
                     // Async read hasn't completed yet.
                     // Inform the caller, while keeping the read in flight.
                     return Err(WinError::NoData);
                 }
+                // Timeout has elapsed, so we must cancel the read operation before proceeding
+                if err == winapi::shared::winerror::WAIT_TIMEOUT {
+                    self.cancel_io();
+                    return Err(WinError::NoData);
+                }
                 // We pass err through to notify_completion so
                 // that it can handle other errors.
-                Err(WinError::from_system(err, "GetOverlappedResult"))
+                Err(WinError::from_system(err, "GetOverlappedResultEx"))
             } else {
                 Ok(())
             };
@@ -927,7 +978,7 @@ fn write_buf(handle: &WinHandle, bytes: &[u8], atomic: AtomicMode) -> Result<(),
                                    bytes_to_write.len() as u32,
                                    &mut sz,
                                    ptr::null_mut())
-                == winapi::shared::minwindef::FALSE
+                == FALSE
             {
                 return Err(WinError::last("WriteFile"));
             }
@@ -952,6 +1003,7 @@ fn write_buf(handle: &WinHandle, bytes: &[u8], atomic: AtomicMode) -> Result<(),
 enum BlockingMode {
     Blocking,
     Nonblocking,
+    Timeout(Duration),
 }
 
 #[derive(Debug)]
@@ -1020,14 +1072,13 @@ impl OsIpcReceiver {
         OsIpcReceiver::from_handle(reader.handle.take())
     }
 
-    // This is only used for recv/try_recv.  When this is added to an IpcReceiverSet, then
+    // This is only used for recv/try_recv/try_recv_timeout.  When this is added to an IpcReceiverSet, then
     // the implementation in select() is used.  It does much the same thing, but across multiple
     // channels.
     fn receive_message(&self, mut blocking_mode: BlockingMode)
                        -> Result<(Vec<u8>, Vec<OsOpaqueIpcChannel>, Vec<OsIpcSharedMemory>, Vec<OwnedDescriptor>),WinError> {
         let mut reader = self.reader.borrow_mut();
         assert!(reader.entry_id.is_none(), "receive_message is only valid before this OsIpcReceiver was added to a Set");
-
         // This function loops, because in the case of a blocking read, we may need to
         // read multiple sets of bytes from the pipe to receive a complete message.
         loop {
@@ -1066,6 +1117,11 @@ impl OsIpcReceiver {
         self.receive_message(BlockingMode::Nonblocking)
     }
 
+    pub fn try_recv_timeout(&self, duration: Duration) -> Result<(Vec<u8>, Vec<OsOpaqueIpcChannel>, Vec<OsIpcSharedMemory>),WinError> {
+        win32_trace!("try_recv_timeout");
+        self.receive_message(BlockingMode::Timeout(duration))
+    }
+
     /// Do a pipe connect.
     ///
     /// Only used for one-shot servers.
@@ -1079,7 +1135,7 @@ impl OsIpcReceiver {
             let ok = winapi::um::namedpipeapi::ConnectNamedPipe(handle.as_raw(), ov.alias_mut().deref_mut());
 
             // we should always get FALSE with async IO
-            assert!(ok == winapi::shared::minwindef::FALSE);
+            assert_eq!(ok, FALSE);
             let result = match GetLastError() {
                 // did we successfully connect? (it's reported as an error [ok==false])
                 winapi::shared::winerror::ERROR_PIPE_CONNECTED => {
@@ -1100,8 +1156,8 @@ impl OsIpcReceiver {
                 // the connect is pending; wait for it to complete
                 winapi::shared::winerror::ERROR_IO_PENDING => {
                     let mut nbytes: u32 = 0;
-                    let ok = winapi::um::ioapiset::GetOverlappedResult(handle.as_raw(), ov.alias_mut().deref_mut(), &mut nbytes, winapi::shared::minwindef::TRUE);
-                    if ok == winapi::shared::minwindef::FALSE {
+                    let ok = winapi::um::ioapiset::GetOverlappedResult(handle.as_raw(), ov.alias_mut().deref_mut(), &mut nbytes, TRUE);
+                    if ok == FALSE {
                         return Err(WinError::last("GetOverlappedResult[ConnectNamedPipe]"));
                     }
                     Ok(())
@@ -1186,7 +1242,7 @@ impl OsIpcSender {
     fn get_pipe_server_process_id(&self) -> Result<winapi::shared::ntdef::ULONG,WinError> {
         unsafe {
             let mut server_pid: winapi::shared::ntdef::ULONG = 0;
-            if winapi::um::winbase::GetNamedPipeServerProcessId(self.handle.as_raw(), &mut server_pid) == winapi::shared::minwindef::FALSE {
+            if winapi::um::winbase::GetNamedPipeServerProcessId(self.handle.as_raw(), &mut server_pid) == FALSE {
                 return Err(WinError::last("GetNamedPipeServerProcessId"));
             }
             Ok(server_pid)
@@ -1201,7 +1257,7 @@ impl OsIpcSender {
             }
 
             let raw_handle = winapi::um::processthreadsapi::OpenProcess(winapi::um::winnt::PROCESS_DUP_HANDLE,
-                                                   winapi::shared::minwindef::FALSE,
+                                                   FALSE,
                                                    server_pid as winapi::shared::minwindef::DWORD);
             if raw_handle.is_null() {
                 return Err(WinError::last("OpenProcess"));
@@ -1464,7 +1520,7 @@ impl OsIpcReceiverSet {
                                                          &mut ov_ptr,
                                                          winapi::um::winbase::INFINITE);
             win32_trace!("[# {:?}] GetQueuedCS -> ok:{} nbytes:{} key:{:?}", self.iocp.as_raw(), ok, nbytes, completion_key);
-            let io_result = if ok == winapi::shared::minwindef::FALSE {
+            let io_result = if ok == FALSE {
                 let err = WinError::last("GetQueuedCompletionStatus");
 
                 // If the OVERLAPPED result is NULL, then the

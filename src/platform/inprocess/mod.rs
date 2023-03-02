@@ -8,7 +8,7 @@
 // except according to those terms.
 
 use bincode;
-use crossbeam_channel::{self, Receiver, Select, Sender, TryRecvError};
+use crossbeam_channel::{self, Receiver, RecvTimeoutError, Select, Sender, TryRecvError};
 use crate::ipc;
 use std::sync::{Arc, Mutex};
 use std::collections::hash_map::HashMap;
@@ -19,6 +19,7 @@ use std::slice;
 use std::fmt::{self, Debug, Formatter};
 use std::cmp::{PartialEq};
 use std::ops::{Deref, RangeFrom};
+use std::time::Duration;
 use std::usize;
 use uuid::Uuid;
 use crate::descriptor::OwnedDescriptor;
@@ -114,6 +115,25 @@ impl OsIpcReceiver {
             }
         }
     }
+
+    pub fn try_recv_timeout(
+        &self,
+        duration: Duration,
+    ) -> Result<(Vec<u8>, Vec<OsOpaqueIpcChannel>, Vec<OsIpcSharedMemory>), ChannelError> {
+        let r = self.receiver.borrow();
+        let r = r.as_ref().unwrap();
+        match r.recv_timeout(duration) {
+            Ok(ChannelMessage(d, c, s)) => {
+                Ok((d, c.into_iter().map(OsOpaqueIpcChannel::new).collect(), s))
+            },
+            Err(e) => {
+                match e {
+                    RecvTimeoutError::Timeout => Err(ChannelError::ChannelEmpty),
+                    RecvTimeoutError::Disconnected => Err(ChannelError::ChannelClosedError),
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -187,7 +207,7 @@ impl OsIpcReceiverSet {
 
         struct Remove(usize, u64);
 
-        // FIXME: Remove early returns and explictly drop `borrows` when lifetimes are non-lexical
+        // FIXME: Remove early returns and explicitly drop `borrows` when lifetimes are non-lexical
         let Remove(r_index, r_id) = {
             let borrows: Vec<_> = self.receivers.iter().map(|r| {
                 Ref::map(r.receiver.borrow(), |o| o.as_ref().unwrap())

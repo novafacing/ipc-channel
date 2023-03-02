@@ -21,6 +21,7 @@ use std::io;
 use std::marker::PhantomData;
 use std::mem;
 use std::ops::Deref;
+use std::time::Duration;
 
 thread_local! {
     static OS_IPC_CHANNELS_FOR_DESERIALIZATION: RefCell<Vec<OsOpaqueIpcChannel>> =
@@ -96,7 +97,7 @@ impl StdError for TryRecvError {
 }
 
 /// Create a connected [IpcSender] and [IpcReceiver] that
-/// transfer messages of a given type privided by type `T`
+/// transfer messages of a given type provided by type `T`
 /// or inferred by the types of messages sent by the sender.
 ///
 /// Messages sent by the sender will be available to the
@@ -210,7 +211,7 @@ pub fn bytes_channel() -> Result<(IpcBytesSender, IpcBytesReceiver), io::Error> 
 /// loop {
 ///     match rx.try_recv() {
 ///         Ok(res) => {
-///             // Do something interesting wth your result
+///             // Do something interesting with your result
 ///             println!("Received data...");
 ///             break;
 ///         },
@@ -269,6 +270,22 @@ impl<T> IpcReceiver<T> where T: for<'de> Deserialize<'de> + Serialize {
             .map_err(IpcError::Bincode)
             .map_err(TryRecvError::IpcError)
     }
+
+    /// Blocks for up to the specified duration attempting to receive a message.
+    ///
+    /// This may block for longer than the specified duration if the channel is busy. If your timeout
+    /// exceeds the duration that your operating system can represent in milliseconds, this may
+    /// block forever. At the time of writing, the smallest duration that may trigger this behavior
+    /// is over 24 days.
+    pub fn try_recv_timeout(&self, duration: Duration) -> Result<T, TryRecvError> {
+        let (data, os_ipc_channels, os_ipc_shared_memory_regions) =
+            self.os_receiver.try_recv_timeout(duration)?;
+        OpaqueIpcMessage::new(data, os_ipc_channels, os_ipc_shared_memory_regions)
+            .to()
+            .map_err(IpcError::Bincode)
+            .map_err(TryRecvError::IpcError)
+    }
+
 
     /// Erase the type of the channel.
     ///
@@ -343,7 +360,7 @@ impl<T> IpcSender<T> where T: Serialize {
         })
     }
 
-    /// Send data accross the channel to the receiver.
+    /// Send data across the channel to the receiver.
     pub fn send(&self, data: T) -> Result<(), bincode::Error> {
         let mut bytes = Vec::with_capacity(4096);
         OS_IPC_CHANNELS_FOR_SERIALIZATION.with(|os_ipc_channels_for_serialization| {

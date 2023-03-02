@@ -20,6 +20,7 @@ use bincode;
 use libc::{self, c_char, c_uint, c_void, size_t};
 use rand::{self, Rng};
 use std::cell::Cell;
+use std::convert::TryInto;
 use std::error::Error as StdError;
 use std::ffi::CString;
 use std::fmt::{self, Debug, Formatter};
@@ -30,6 +31,7 @@ use std::ops::Deref;
 use std::ptr;
 use std::slice;
 use std::sync::RwLock;
+use std::time::Duration;
 use std::usize;
 
 use std::os::raw::c_int;
@@ -376,6 +378,11 @@ impl OsIpcReceiver {
     pub fn try_recv(&self)
                     -> Result<(Vec<u8>, Vec<OsOpaqueIpcChannel>, Vec<OsIpcSharedMemory>, Vec<OwnedDescriptor>),MachError> {
         self.recv_with_blocking_mode(BlockingMode::Nonblocking)
+    }
+
+    pub fn try_recv_timeout(&self, duration: Duration)
+                    -> Result<(Vec<u8>, Vec<OsOpaqueIpcChannel>, Vec<OsIpcSharedMemory>),MachError> {
+        self.recv_with_blocking_mode(BlockingMode::Timeout(duration))
     }
 }
 
@@ -727,6 +734,7 @@ impl OsIpcSelectionResult {
 enum BlockingMode {
     Blocking,
     Nonblocking,
+    Timeout(Duration),
 }
 
 fn select(port: mach_port_t, blocking_mode: BlockingMode)
@@ -740,6 +748,11 @@ fn select(port: mach_port_t, blocking_mode: BlockingMode)
         let (flags, timeout) = match blocking_mode {
             BlockingMode::Blocking => (MACH_RCV_MSG | MACH_RCV_LARGE, MACH_MSG_TIMEOUT_NONE),
             BlockingMode::Nonblocking => (MACH_RCV_MSG | MACH_RCV_LARGE | MACH_RCV_TIMEOUT, 0),
+            BlockingMode::Timeout(duration) => duration
+                .as_millis()
+                .try_into()
+                .map(|ms| (MACH_RCV_MSG | MACH_RCV_LARGE | MACH_RCV_TIMEOUT, ms))
+                .unwrap_or((MACH_RCV_MSG | MACH_RCV_LARGE, MACH_MSG_TIMEOUT_NONE)),
         };
         match mach_sys::mach_msg(message as *mut _,
                                  flags,

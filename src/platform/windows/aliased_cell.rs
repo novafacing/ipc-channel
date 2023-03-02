@@ -20,7 +20,7 @@ impl Drop for DropBomb {
         if thread::panicking() {
             eprintln!("{}", message);
         } else {
-            panic!(message);
+            panic!("{}", message);
         }
     }
 }
@@ -60,7 +60,7 @@ impl Drop for DropBomb {
 /// Leaking the memory, while undesirable in general,
 /// keeps the memory accessible to any outstanding aliases.
 /// This is the only way to retain soundness during unwinding,
-/// or when the panic gets catched.
+/// or when the panic gets caught.
 ///
 /// Note that making FFI access through untracked aliases
 /// requires the value to have a stable memory location --
