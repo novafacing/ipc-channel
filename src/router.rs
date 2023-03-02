@@ -8,11 +8,10 @@
 // except according to those terms.
 
 //! Routers allow converting IPC channels to crossbeam channels.
-//! The [RouterProxy](router::RouterProxy) provides various methods to register `IpcReceiver<T>`s.
-//! The router will then either call the appropriate callback
-//! or route the message to a crossbeam `Sender<T>` or `Receiver<T>`.
-//! You should use the global `ROUTER` to access the `RouterProxy` methods (via `ROUTER`'s
-//! `Deref` for `RouterProxy`.
+//! The [RouterProxy](crate::router::RouterProxy) provides various methods to register
+//! `IpcReceiver<T>`s. The router will then either call the appropriate callback or route the
+//! message to a crossbeam `Sender<T>` or `Receiver<T>`. You should use the global `ROUTER` to
+//! access the `RouterProxy` methods (via `ROUTER`'s `Deref` for `RouterProxy`.
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::thread;
@@ -158,7 +157,7 @@ impl Router {
         }
     }
 
-    /// Continously loop waiting for wakeup signals from router proxy.
+    /// Continuously loop waiting for wakeup signals from router proxy.
     /// Iterate over events either:
     /// 1) If a message comes in from our special `wakeup_receiver` (identified through
     ///    msg_wakeup_id. Read message from `msg_receiver` and add a new receiver

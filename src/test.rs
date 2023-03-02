@@ -55,6 +55,7 @@ use crate::ipc::IpcOneShotServer;
     target_os = "ios"
 )))]
 use std::io::Error;
+use std::time::{Duration, Instant};
 
 #[cfg(not(any(
     feature = "force-inprocess",
@@ -512,6 +513,33 @@ fn try_recv() {
 }
 
 #[test]
+fn try_recv_timeout() {
+    let person = ("Jacob Kiesel".to_owned(), 25);
+    let (tx, rx) = ipc::channel().unwrap();
+    let timeout = Duration::from_millis(1000);
+    let start_recv = Instant::now();
+    match rx.try_recv_timeout(timeout) {
+        Err(ipc::TryRecvError::Empty) => assert!(start_recv.elapsed() >= Duration::from_millis(500)),
+        v => panic!("Expected empty channel err: {:?}", v),
+    }
+    tx.send(person.clone()).unwrap();
+    let start_recv = Instant::now();
+    let received_person = rx.try_recv_timeout(timeout).unwrap();
+    assert!(start_recv.elapsed() < timeout);
+    assert_eq!(person, received_person);
+    let start_recv = Instant::now();
+    match rx.try_recv_timeout(timeout) {
+        Err(ipc::TryRecvError::Empty) => assert!(start_recv.elapsed() >= Duration::from_millis(500)),
+        v => panic!("Expected empty channel err: {:?}", v),
+    }
+    drop(tx);
+    match rx.try_recv_timeout(timeout) {
+        Err(ipc::TryRecvError::IpcError(ipc::IpcError::Disconnected)) => (),
+        v => panic!("Expected disconnected err: {:?}", v),
+    }
+}
+
+#[test]
 fn multiple_paths_to_a_sender() {
     let person = ("Patrick Walton".to_owned(), 29);
     let (sub_tx, sub_rx) = ipc::channel().unwrap();
@@ -651,4 +679,28 @@ fn test_receiver_stream() {
         Poll::Ready(Some(Ok(5))) => (),
         _ => panic!("Stream should have 5"),
     };
+}
+
+#[test]
+fn test_transfer_descriptor() {
+    let person = ("Patrick Walton".to_owned(), 29);
+    let person_clone = person.clone();
+    let temp_file_path = std::env::temp_dir().join("ipc-channel-test.txt" );
+    let mut file = std::fs::File::create(& temp_file_path).unwrap();
+    let text = "This is a text string";
+    use std::io::Write;
+    file.write(text.as_bytes()).unwrap();
+    std::mem::drop(file);
+    let file = std::fs::File::open(& temp_file_path).unwrap();
+
+    let person_and_descriptor = (person, crate::descriptor::OwnedDescriptor::from(file));
+    let (tx, rx) = ipc::channel().unwrap();
+    tx.send(person_and_descriptor).unwrap();
+    let received_person_and_descriptor = rx.recv().unwrap();
+    assert_eq!(received_person_and_descriptor.0, person_clone);
+    let mut file: std::fs::File = received_person_and_descriptor.1.into();
+    use std::io::Read;
+    let mut read_text = String::new();
+    file.read_to_string(&mut read_text).unwrap();
+    assert_eq!(text, read_text);
 }
