@@ -11,7 +11,7 @@ use crate::descriptor::OwnedDescriptor;
 use crate::ipc;
 use bincode;
 use fnv::FnvHasher;
-use libc::{self, MAP_FAILED, MAP_SHARED, PROT_READ, PROT_WRITE, SOCK_SEQPACKET, SOL_SOCKET};
+use libc::{self, stat, MAP_FAILED, MAP_SHARED, PROT_READ, PROT_WRITE, SOCK_SEQPACKET, SOL_SOCKET};
 use libc::{c_char, c_int, c_void, getsockopt, SO_LINGER};
 use libc::{iovec, msghdr, off_t, recvmsg, sendmsg};
 use libc::{sa_family_t, setsockopt, size_t, sockaddr, sockaddr_un, socketpair, socklen_t};
@@ -183,7 +183,15 @@ impl OsIpcReceiver {
     pub fn try_recv_timeout(
         &self,
         duration: Duration,
-    ) -> Result<(Vec<u8>, Vec<OsOpaqueIpcChannel>, Vec<OsIpcSharedMemory>), UnixError> {
+    ) -> Result<
+        (
+            Vec<u8>,
+            Vec<OsOpaqueIpcChannel>,
+            Vec<OsIpcSharedMemory>,
+            Vec<OwnedDescriptor>,
+        ),
+        UnixError,
+    > {
         recv(self.fd.get(), BlockingMode::Timeout(duration))
     }
 }
@@ -809,9 +817,9 @@ impl BackingStore {
 
     pub unsafe fn map_file(&self, length: Option<size_t>) -> (*mut u8, size_t) {
         let length = length.unwrap_or_else(|| {
-            let mut st = mem::MaybeUninit::uninit().assume_init();
-            assert!(libc::fstat(self.fd, &mut st) == 0);
-            st.st_size as size_t
+            let mut st = mem::MaybeUninit::<stat>::uninit();
+            assert!(libc::fstat(self.fd, st.as_mut_ptr()) == 0);
+            st.assume_init().st_size as size_t
         });
         if length == 0 {
             // This will cause `mmap` to fail, so handle it explicitly.
